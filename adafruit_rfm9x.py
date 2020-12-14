@@ -33,18 +33,23 @@ import time
 import random
 from micropython import const
 
-
 import adafruit_bus_device.spi_device as spidev
-
 
 __version__ = "0.0.0-auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_RFM9x.git"
 
-
 # Internal constants:
 # Register names (FSK Mode even though we use LoRa instead, from table 85)
+
+# Common to LORA and FSK
 _RH_RF95_REG_00_FIFO = const(0x00)
 _RH_RF95_REG_01_OP_MODE = const(0x01)
+
+# FSK / OOK
+_RH_RF95_REG_02_BITRATE_MSB = const(0x02)
+_RH_RF95_REG_03_BITRATE_LSB = const(0x03)
+
+# Common to both
 _RH_RF95_REG_06_FRF_MSB = const(0x06)
 _RH_RF95_REG_07_FRF_MID = const(0x07)
 _RH_RF95_REG_08_FRF_LSB = const(0x08)
@@ -52,6 +57,8 @@ _RH_RF95_REG_09_PA_CONFIG = const(0x09)
 _RH_RF95_REG_0A_PA_RAMP = const(0x0A)
 _RH_RF95_REG_0B_OCP = const(0x0B)
 _RH_RF95_REG_0C_LNA = const(0x0C)
+
+# LORA
 _RH_RF95_REG_0D_FIFO_ADDR_PTR = const(0x0D)
 _RH_RF95_REG_0E_FIFO_TX_BASE_ADDR = const(0x0E)
 _RH_RF95_REG_0F_FIFO_RX_BASE_ADDR = const(0x0F)
@@ -83,6 +90,16 @@ _RH_RF95_REG_40_DIO_MAPPING1 = const(0x40)
 _RH_RF95_REG_41_DIO_MAPPING2 = const(0x41)
 _RH_RF95_REG_42_VERSION = const(0x42)
 
+# OOK Registers
+_RH_OOK_REG_11_RSSI_VALUE = const(0x11)
+_RH_OOK_REG_30_PACKET_CONFIG1 = const(0x30)
+_RH_OOK_REG_31_PACKET_CONFIG2 = const(0x31)
+_RH_OOK_REG_32_PAYLOAD_LENGTH = const(0x32)
+_RH_OOK_REG_5D_BITRATE_FRAC = const(0x5d)
+_RH_OOK_REG_3E_IRQ_FLAGS1 = const(0x3e)
+_RH_OOK_REG_3E_IRQ_FLAGS2 = const(0x3f)
+
+# Common
 _RH_RF95_REG_4B_TCXO = const(0x4B)
 _RH_RF95_REG_4D_PA_DAC = const(0x4D)
 _RH_RF95_REG_5B_FORMER_TEMP = const(0x5B)
@@ -94,6 +111,7 @@ _RH_RF95_REG_64_AGC_THRESH3 = const(0x64)
 _RH_RF95_DETECTION_OPTIMIZE = const(0x31)
 _RH_RF95_DETECTION_THRESHOLD = const(0x37)
 
+# CONSTANTS
 _RH_RF95_PA_DAC_DISABLE = const(0x04)
 _RH_RF95_PA_DAC_ENABLE = const(0x07)
 
@@ -119,6 +137,9 @@ FS_TX_MODE = 0b010
 TX_MODE = 0b011
 FS_RX_MODE = 0b100
 RX_MODE = 0b101
+
+_FSK_MODULATION = const(0x0)
+_OOK_MODULATION = const(0x1)
 
 
 # Disable the too many instance members warning.  Pylint has no knowledge
@@ -227,17 +248,26 @@ class RFM9x:
 
     bw_bins = (7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000)
 
+    # FSK / OOK Specific
+    packet_format = _RegisterBits(_RH_OOK_REG_30_PACKET_CONFIG1, offset=7, bits=1)
+    crc_enabled = _RegisterBits(_RH_OOK_REG_30_PACKET_CONFIG1, offset=4, bits=1)
+
+    data_mode = _RegisterBits(_RH_OOK_REG_31_PACKET_CONFIG2, offset=6, bits=1)
+    payload_length_msb = _RegisterBits(_RH_OOK_REG_31_PACKET_CONFIG2, bits=2)
+
     def __init__(
-        self,
-        spi,
-        cs,
-        reset,
-        frequency,
-        *,
-        preamble_length=8,
-        high_power=True,
-        baudrate=5000000
+            self,
+            spi,
+            cs,
+            reset,
+            frequency,
+            *,
+            lora_mode=True,
+            preamble_length=8,
+            high_power=True,
+            baudrate=5000000
     ):
+        self.lora_mode = lora_mode
         self.high_power = high_power
         # Device support SPI mode 0 (polarity & phase = 0) up to a max of 10mhz.
         # Set Default Baudrate to 5MHz to avoid problems
@@ -260,15 +290,27 @@ class RFM9x:
         # Also set long range mode (LoRa mode) as it can only be done in sleep.
         self.sleep()
         time.sleep(0.01)
-        self.long_range_mode = True
-        if self.operation_mode != SLEEP_MODE or not self.long_range_mode:
-            raise RuntimeError("Failed to configure radio for LoRa mode, check wiring!")
+        if self.lora_mode:
+            self.long_range_mode = True
+            if self.operation_mode != SLEEP_MODE or not self.long_range_mode:
+                raise RuntimeError("Failed to configure radio for LoRa mode, check wiring!")
+        else:
+            # Set to FSK / OOK mode
+            self.long_range_mode = False
+            if self.operation_mode != SLEEP_MODE or not self.long_range_mode:
+                raise RuntimeError("Failed to configure radio for OOK mode, check wiring!")
+            self.modulation_type = _OOK_MODULATION
+
         # clear default setting for access to LF registers if frequency > 525MHz
         if frequency > 525:
             self.low_frequency_mode = 0
-        # Setup entire 256 byte FIFO
-        self._write_u8(_RH_RF95_REG_0E_FIFO_TX_BASE_ADDR, 0x00)
-        self._write_u8(_RH_RF95_REG_0F_FIFO_RX_BASE_ADDR, 0x00)
+
+        if self.lora_mode:
+            # Setup entire 256 byte FIFO
+            self._write_u8(_RH_RF95_REG_0E_FIFO_TX_BASE_ADDR, 0x00)
+            self._write_u8(_RH_RF95_REG_0F_FIFO_RX_BASE_ADDR, 0x00)
+        # We can't configure base addr's in FSK / OOK mode
+
         # Set mode idle
         self.idle()
         # Set frequency
@@ -282,7 +324,9 @@ class RFM9x:
         # Default to disable CRC checking on incoming packets.
         self.enable_crc = False
         # Note no sync word is set for LoRa mode either!
-        self._write_u8(_RH_RF95_REG_26_MODEM_CONFIG3, 0x00)  # Preamble lsb?
+
+        # This is the default value?
+        # self._write_u8(_RH_RF95_REG_26_MODEM_CONFIG3, 0x00)  # Preamble lsb?
         # Set transmit power to 13 dBm, a safe value any module supports.
         self.tx_power = 13
         # initialize last RSSI reading
@@ -468,6 +512,7 @@ class RFM9x:
 
     @tx_power.setter
     def tx_power(self, val):
+        # Same for both
         val = int(val)
         if self.high_power:
             if val < 5 or val > 23:
@@ -492,14 +537,18 @@ class RFM9x:
         """The received strength indicator (in dBm) of the last received message."""
         # Read RSSI register and convert to value using formula in datasheet.
         # Remember in LoRa mode the payload register changes function to RSSI!
-        return self._read_u8(_RH_RF95_REG_1A_PKT_RSSI_VALUE) - 137
+        if self.lora_mode:
+            return self._read_u8(_RH_RF95_REG_1A_PKT_RSSI_VALUE) - 137
+        else:
+            # In DBM, for OOK / FSK
+            return - self._read_u8(_RH_OOK_REG_11_RSSI_VALUE) / 2
 
     @property
     def signal_bandwidth(self):
         """The signal bandwidth used by the radio (try setting to a higher
         value to increase throughput or to a lower value to increase the
         likelihood of successfully received payloads).  Valid values are
-        listed in RFM9x.bw_bins."""
+        listed in RFM9x.bw_bins. Only used with LoRa"""
         bw_id = (self._read_u8(_RH_RF95_REG_1D_MODEM_CONFIG1) & 0xF0) >> 4
         if bw_id >= len(self.bw_bins):
             current_bandwidth = 500000
@@ -521,6 +570,21 @@ class RFM9x:
         )
 
     @property
+    def bitrate(self):
+        """The bitrate of the radio, in OOK / FSK mode."""
+        msb = self._read_u8(_RH_RF95_REG_02_BITRATE_MSB) << 8
+        lsb = self._read_u8(_RH_RF95_REG_03_BITRATE_LSB)
+        # Frac has no affect in OOK mode
+        return _RH_RF95_FXOSC / (msb + lsb)
+
+    @bitrate.setter
+    def bitrate(self, bitrate):
+        # TODO: Check if an acceptable value
+        reg_value = _RH_RF95_FXOSC // bitrate
+        self._write_u8(_RH_RF95_REG_02_BITRATE_MSB, (reg_value >> 8) & 0xFF)
+        self._write_u8(_RH_RF95_REG_03_BITRATE_LSB, reg_value & 0xFF)
+
+    @property
     def coding_rate(self):
         """The coding rate used by the radio to control forward error
         correction (try setting to a higher value to increase tolerance of
@@ -532,7 +596,7 @@ class RFM9x:
 
     @coding_rate.setter
     def coding_rate(self, val):
-        # Set coding rate (set to 5 to match RadioHead Cr45).
+        # Set coding rate (set to 5 to match RadioHead Cr45). Only works for Lora.
         denominator = min(max(val, 5), 8)
         cr_id = denominator - 4
         self._write_u8(
@@ -558,8 +622,8 @@ class RFM9x:
         self._write_u8(
             _RH_RF95_REG_1E_MODEM_CONFIG2,
             (
-                (self._read_u8(_RH_RF95_REG_1E_MODEM_CONFIG2) & 0x0F)
-                | ((val << 4) & 0xF0)
+                    (self._read_u8(_RH_RF95_REG_1E_MODEM_CONFIG2) & 0x0F)
+                    | ((val << 4) & 0xF0)
             ),
         )
 
@@ -586,25 +650,38 @@ class RFM9x:
 
     def tx_done(self):
         """Transmit status"""
-        return (self._read_u8(_RH_RF95_REG_12_IRQ_FLAGS) & 0x8) >> 3
+        if self.lora_mode:
+            return (self._read_u8(_RH_RF95_REG_12_IRQ_FLAGS) & 0x8) >> 3
+        else:
+            return (self._read_u8(_RH_OOK_REG_3E_IRQ_FLAGS1) & 0x20) >> 5
 
     def rx_done(self):
         """Receive status"""
-        return (self._read_u8(_RH_RF95_REG_12_IRQ_FLAGS) & 0x40) >> 6
+        if self.lora_mode:
+            return (self._read_u8(_RH_RF95_REG_12_IRQ_FLAGS) & 0x40) >> 6
+        else:
+            return (self._read_u8(_RH_OOK_REG_3E_IRQ_FLAGS1) & 0x40) >> 6
+
+    def _clear_interrupt_flags(self):
+        if self.lora_mode:
+            self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+        else:
+            self._write_u8(_RH_OOK_REG_3E_IRQ_FLAGS1, 0xFF)
 
     def crc_error(self):
         """crc status"""
+        # TODO: Implement for FSK / OOK
         return (self._read_u8(_RH_RF95_REG_12_IRQ_FLAGS) & 0x20) >> 5
 
     def send(
-        self,
-        data,
-        *,
-        keep_listening=False,
-        destination=None,
-        node=None,
-        identifier=None,
-        flags=None
+            self,
+            data,
+            *,
+            keep_listening=False,
+            destination=None,
+            node=None,
+            identifier=None,
+            flags=None
     ):
         """Send a string of data using the transmitter.
            You can only send 252 bytes at a time
@@ -648,10 +725,16 @@ class RFM9x:
         else:  # use kwarg
             payload[3] = flags
         payload = payload + data
+
         # Write payload.
         self._write_from(_RH_RF95_REG_00_FIFO, payload)
-        # Write payload and header length.
-        self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH, len(payload))
+
+        # Write length
+        if self.lora_mode:
+            self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH, len(payload))
+        # In unlimited mode for FSK, we don't need to explicitly set packet length
+        # In fixed mode, we only set the length once
+
         # Turn on transmit mode to send out the packet.
         self.transmit()
         # Wait for tx done interrupt with explicit polling (not ideal but
@@ -667,8 +750,8 @@ class RFM9x:
         else:
             # Enter idle mode to stop receiving other packets.
             self.idle()
-        # Clear interrupt.
-        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+
+        self._clear_interrupt_flags()
         return not timed_out
 
     def send_with_ack(self, data):
@@ -710,7 +793,7 @@ class RFM9x:
 
     # pylint: disable=too-many-branches
     def receive(
-        self, *, keep_listening=True, with_header=False, with_ack=False, timeout=None
+            self, *, keep_listening=True, with_header=False, with_ack=False, timeout=None
     ):
         """Wait to receive a packet from the receiver. If a packet is found the payload bytes
            are returned, otherwise None is returned (which indicates the timeout elapsed with no
@@ -768,16 +851,16 @@ class RFM9x:
                     packet = None
                 else:
                     if (
-                        self.node != _RH_BROADCAST_ADDRESS
-                        and packet[0] != _RH_BROADCAST_ADDRESS
-                        and packet[0] != self.node
+                            self.node != _RH_BROADCAST_ADDRESS
+                            and packet[0] != _RH_BROADCAST_ADDRESS
+                            and packet[0] != self.node
                     ):
                         packet = None
                     # send ACK unless this was an ACK or a broadcast
                     elif (
-                        with_ack
-                        and ((packet[3] & _RH_FLAGS_ACK) == 0)
-                        and (packet[0] != _RH_BROADCAST_ADDRESS)
+                            with_ack
+                            and ((packet[3] & _RH_FLAGS_ACK) == 0)
+                            and (packet[0] != _RH_BROADCAST_ADDRESS)
                     ):
                         # delay before sending Ack to give receiver a chance to get ready
                         if self.ack_delay is not None:
@@ -792,13 +875,13 @@ class RFM9x:
                         )
                         # reject Retries if we have seen this idetifier from this source before
                         if (self.seen_ids[packet[1]] == packet[2]) and (
-                            packet[3] & _RH_FLAGS_RETRY
+                                packet[3] & _RH_FLAGS_RETRY
                         ):
                             packet = None
                         else:  # save the packet identifier for this source
                             self.seen_ids[packet[1]] = packet[2]
                     if (
-                        not with_header and packet is not None
+                            not with_header and packet is not None
                     ):  # skip the header if not wanted
                         packet = packet[4:]
         # Listen again if necessary and return the result packet.
@@ -807,6 +890,6 @@ class RFM9x:
         else:
             # Enter idle mode to stop receiving other packets.
             self.idle()
-        # Clear interrupt.
-        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+
+        self._clear_interrupt_flags()
         return packet
